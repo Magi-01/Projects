@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+title: Image Captioning
+message: >-
+  Following instructions found at
+  https://github.com/sgrvinod/a-PyTorch-Tutorial-to-Image-Captioning?tab=readme-ov-file
+  Implementation of MSCOCO '14 Dataset for image captioning using CFF and RNN
+type: software
+authors:
+  - given-names: Mutua
+    family-names: Fadhla Mohamed
