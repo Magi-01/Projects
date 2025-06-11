@@ -47,11 +47,11 @@ def main():
     with open(word_map_file, 'r') as j:
         word_map = json.load(j)
 
-    if os.path.exists('/media/user/Ubunt_2/caption_results/checkpoint/BEST_checkpoint_coco_5_cap_per_img_5_min_word_freq.pth.tar'):
-        checkpoint = '/media/user/Ubunt_2/caption_results/checkpoint/BEST_checkpoint_coco_5_cap_per_img_5_min_word_freq.pth.tar'
+    if os.path.exists('/media/fadhla/Ubunt_2/caption_results/checkpoint/BEST_checkpoint_coco_5_cap_per_img_5_min_word_freq.pth.tar'):
+        checkpoint = '/media/fadhla/Ubunt_2/caption_results/checkpoint/BEST_checkpoint_coco_5_cap_per_img_5_min_word_freq.pth.tar'
 
-    if os.path.exists('/media/user/Ubunt_2/caption_results/checkpoint/TRAIN_checkpoint_coco_5_cap_per_img_5_min_word_freq.pth.tar'):
-        traincheckpoint = '/media/user/Ubunt_2/caption_results/checkpoint/TRAIN_checkpoint_coco_5_cap_per_img_5_min_word_freq.pth.tar'
+    if os.path.exists('/media/fadhla/Ubunt_2/caption_results/checkpoint/TRAIN_checkpoint_coco_5_cap_per_img_5_min_word_freq.pth.tar'):
+        traincheckpoint = '/media/fadhla/Ubunt_2/caption_results/checkpoint/TRAIN_checkpoint_coco_5_cap_per_img_5_min_word_freq.pth.tar'
 
     # Initialize models and optimizers
     decoder = DecoderWithAttention(attention_dim=attention_dim,
@@ -77,9 +77,23 @@ def main():
 
         decoder.load_state_dict(cp['decoder'].state_dict())
         decoder_optimizer.load_state_dict(cp['decoder_optimizer'].state_dict())
+
+        # Move decoder optimizer tensors to device
+        for state in decoder_optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device)
+
         encoder.load_state_dict(cp['encoder'].state_dict())
+
         if fine_tune_encoder and cp['encoder_optimizer'] is not None:
             encoder_optimizer.load_state_dict(cp['encoder_optimizer'].state_dict())
+
+            # Move encoder optimizer tensors to device
+            for state in encoder_optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(device)
 
     # Load traincheckpoint (pre-validation, e.g., training resumed mid-run)
     elif traincheckpoint is not None:
@@ -91,9 +105,23 @@ def main():
 
         decoder.load_state_dict(cp['decoder'].state_dict())
         decoder_optimizer.load_state_dict(cp['decoder_optimizer'].state_dict())
+
+        # Move decoder optimizer tensors to device
+        for state in decoder_optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device)
+
         encoder.load_state_dict(cp['encoder'].state_dict())
+        
         if fine_tune_encoder and cp['encoder_optimizer'] is not None:
             encoder_optimizer.load_state_dict(cp['encoder_optimizer'].state_dict())
+
+            # Move encoder optimizer tensors to device
+            for state in encoder_optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(device)
 
     else:
         print("Starting from scratch.")
@@ -197,6 +225,10 @@ def train(train_loader, encoder, decoder, criterion, encoder_optimizer, decoder_
         imgs = encoder(imgs)
         scores, caps_sorted, decode_lengths, alphas, sort_ind = decoder(imgs, caps, caplens)
 
+        scores = scores.to(device)
+        alphas = alphas.to(device)
+        caps_sorted = caps_sorted.to(device)
+
         # Since we decoded starting with <start>, the targets are all words after <start>, up to <end>
         targets = caps_sorted[:, 1:]
 
@@ -207,6 +239,9 @@ def train(train_loader, encoder, decoder, criterion, encoder_optimizer, decoder_
 
         scores = scores.data
         targets = targets.data
+
+        scores = scores.to(device)
+        targets = targets.to(device)
 
         # Calculate loss
         loss = criterion(scores, targets)
