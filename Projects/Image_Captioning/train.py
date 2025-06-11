@@ -9,7 +9,7 @@ from models import Encoder, DecoderWithAttention
 from datasets import *
 from utils import *
 from nltk.translate.bleu_score import corpus_bleu
-
+#bleu-4 epoch 0 = 0.2202936406397956
 # Data parameters
 data_folder = '/media/fadhla/Ubunt_2/caption_results'  # folder with data files saved by create_input_files.py
 data_name = 'coco_5_cap_per_img_5_min_word_freq'  # base name shared by data files
@@ -36,47 +36,70 @@ best_bleu4 = 0.  # BLEU-4 score right now
 print_freq = 100  # print training/validation stats every __ batches
 fine_tune_encoder = False  # fine-tune encoder?
 checkpoint = None  # path to checkpoint, None if none
+traincheckpoint = None
 
 
 def main():
-    """
-    Training and validation.
-    """
-
-    global best_bleu4, epochs_since_improvement, checkpoint, start_epoch, fine_tune_encoder, data_name, word_map
+    global best_bleu4, epochs_since_improvement, checkpoint, traincheckpoint, start_epoch, fine_tune_encoder, data_name, word_map
 
     # Read word map
     word_map_file = os.path.join(data_folder, 'WORDMAP_' + data_name + '.json')
     with open(word_map_file, 'r') as j:
         word_map = json.load(j)
 
-    # Initialize / load checkpoint
-    if checkpoint is None:
-        decoder = DecoderWithAttention(attention_dim=attention_dim,
-                                       embed_dim=emb_dim,
-                                       decoder_dim=decoder_dim,
-                                       vocab_size=len(word_map),
-                                       dropout=dropout)
-        decoder_optimizer = torch.optim.Adam(params=filter(lambda p: p.requires_grad, decoder.parameters()),
-                                             lr=decoder_lr)
-        encoder = Encoder()
-        encoder.fine_tune(fine_tune_encoder)
-        encoder_optimizer = torch.optim.Adam(params=filter(lambda p: p.requires_grad, encoder.parameters()),
-                                             lr=encoder_lr) if fine_tune_encoder else None
+    if os.path.exists('/media/user/Ubunt_2/caption_results/checkpoint/BEST_checkpoint_coco_5_cap_per_img_5_min_word_freq.pth.tar'):
+        checkpoint = '/media/user/Ubunt_2/caption_results/checkpoint/BEST_checkpoint_coco_5_cap_per_img_5_min_word_freq.pth.tar'
+
+    if os.path.exists('/media/user/Ubunt_2/caption_results/checkpoint/TRAIN_checkpoint_coco_5_cap_per_img_5_min_word_freq.pth.tar'):
+        traincheckpoint = '/media/user/Ubunt_2/caption_results/checkpoint/TRAIN_checkpoint_coco_5_cap_per_img_5_min_word_freq.pth.tar'
+
+    # Initialize models and optimizers
+    decoder = DecoderWithAttention(attention_dim=attention_dim,
+                                   embed_dim=emb_dim,
+                                   decoder_dim=decoder_dim,
+                                   vocab_size=len(word_map),
+                                   dropout=dropout)
+    encoder = Encoder()
+
+    decoder_optimizer = torch.optim.Adam(params=filter(lambda p: p.requires_grad, decoder.parameters()),
+                                         lr=decoder_lr)
+    encoder_optimizer = torch.optim.Adam(params=filter(lambda p: p.requires_grad, encoder.parameters()),
+                                         lr=encoder_lr) if fine_tune_encoder else None
+    encoder.fine_tune(fine_tune_encoder)
+
+    # Load checkpoint (post-validation best model)
+    if checkpoint is not None:
+        print(f"Loading checkpoint: {checkpoint}")
+        cp = torch.load(checkpoint, map_location=device, weights_only=False)
+        start_epoch = cp['epoch'] + 1
+        epochs_since_improvement = cp['epochs_since_improvement']
+        best_bleu4 = cp['bleu-4']
+
+        decoder.load_state_dict(cp['decoder'].state_dict())
+        decoder_optimizer.load_state_dict(cp['decoder_optimizer'].state_dict())
+        encoder.load_state_dict(cp['encoder'].state_dict())
+        if fine_tune_encoder and cp['encoder_optimizer'] is not None:
+            encoder_optimizer.load_state_dict(cp['encoder_optimizer'].state_dict())
+
+    # Load traincheckpoint (pre-validation, e.g., training resumed mid-run)
+    elif traincheckpoint is not None:
+        print(f"Loading training checkpoint: {traincheckpoint}")
+        cp = torch.load(traincheckpoint, map_location=device, weights_only=False)
+        start_epoch = cp['epoch'] + 1
+        epochs_since_improvement = cp['epochs_since_improvement']
+        best_bleu4 = cp['bleu-4']
+
+        decoder.load_state_dict(cp['decoder'].state_dict())
+        decoder_optimizer.load_state_dict(cp['decoder_optimizer'].state_dict())
+        encoder.load_state_dict(cp['encoder'].state_dict())
+        if fine_tune_encoder and cp['encoder_optimizer'] is not None:
+            encoder_optimizer.load_state_dict(cp['encoder_optimizer'].state_dict())
 
     else:
-        checkpoint = torch.load(checkpoint)
-        start_epoch = checkpoint['epoch'] + 1
-        epochs_since_improvement = checkpoint['epochs_since_improvement']
-        best_bleu4 = checkpoint['bleu-4']
-        decoder = checkpoint['decoder']
-        decoder_optimizer = checkpoint['decoder_optimizer']
-        encoder = checkpoint['encoder']
-        encoder_optimizer = checkpoint['encoder_optimizer']
-        if fine_tune_encoder is True and encoder_optimizer is None:
-            encoder.fine_tune(fine_tune_encoder)
-            encoder_optimizer = torch.optim.Adam(params=filter(lambda p: p.requires_grad, encoder.parameters()),
-                                                 lr=encoder_lr)
+        print("Starting from scratch.")
+        start_epoch = 0
+        epochs_since_improvement = 0
+        best_bleu4 = 0.0
 
     # Move to GPU, if available
     decoder = decoder.to(device)
@@ -114,6 +137,9 @@ def main():
               encoder_optimizer=encoder_optimizer,
               decoder_optimizer=decoder_optimizer,
               epoch=epoch)
+        
+        save_checkpoint_train(data_name, epoch, epochs_since_improvement, encoder, decoder,
+                encoder_optimizer, decoder_optimizer, best_bleu4)
 
         # One epoch's validation
         recent_bleu4 = validate(val_loader=val_loader,
@@ -273,6 +299,9 @@ def validate(val_loader, encoder, decoder, criterion):
             scores = pack_padded_sequence(scores, decode_lengths, batch_first=True)
             targets = pack_padded_sequence(targets, decode_lengths, batch_first=True)
 
+            scores = scores.data
+            targets = targets.data
+
             # Calculate loss
             loss = criterion(scores, targets)
 
@@ -299,6 +328,7 @@ def validate(val_loader, encoder, decoder, criterion):
             # references = [[ref1a, ref1b, ref1c], [ref2a, ref2b], ...], hypotheses = [hyp1, hyp2, ...]
 
             # References
+            allcaps = allcaps.to(device)
             allcaps = allcaps[sort_ind]  # because images were sorted in the decoder
             for j in range(allcaps.shape[0]):
                 img_caps = allcaps[j].tolist()
