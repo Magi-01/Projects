@@ -1,0 +1,709 @@
+"""
+SDSS Multimodal Classification Pipeline
+=========================================
+Every classifier receives up to TWO inputs:
+  .) image   — 128×128 RGB JPEG cutout
+  .) tabular — photometric feature vector derived from the CSV, one of:
+
+     tabular1 : u, g, r, i           (4 raw magnitudes)
+                u-g, g-r, r-i        (3 colour indices)
+                ──────────────────────────────────────
+                TAB_DIM = 7 total
+
+     tabular2 : u, g, r, i, z            (5 raw magnitudes)
+                u-g, g-r, r-i, z-i       (4 colour indices)
+                ──────────────────────────────────────────
+                TAB_DIM = 9 total
+
+Image Augmentation:
+The training images are:
+    .) Horizontally and Vertically flipped
+    .) Rotated clockwise/anti-clockwise
+    .) Rescaled
+
+Stage 1 : CNN with Adam                   (image → class)
+Stage 2 : CNN with Adam and table1        (image + tabular1 → class)
+Stage 3 : CNN with Adam and table2        (image + tabular2 → class)
+Stage 4 : Metrics
+
+All three stages share one stratified 70/20/10 train/val/test split (fit
+once in build_splits) so their metrics are directly comparable.
+
+Checkpointing
+-------------
+A checkpoint is saved every epoch (regardless of whether val_loss improved).
+On resume, the loop fast-forwards through already-completed epochs by loading
+the most recent checkpoint, then continues training from there.
+Best weights are tracked separately in memory and restored at the end.
+
+Debug
+-----
+DEBUG             = True   → ipdb breakpoints at key checkpoints
+BREAK_AFTER_BATCH = True   → stop after first batch (shape/device sanity check)
+"""
+
+# ── Stdlib ────────────────────────────────────────────────────────────────────
+import os, time, random, warnings, pickle
+warnings.filterwarnings("ignore")
+
+# ── Third-party ───────────────────────────────────────────────────────────────
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from PIL import Image
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    classification_report, confusion_matrix,
+    accuracy_score, f1_score
+)
+from sklearn.preprocessing import StandardScaler
+
+try:
+    import ipdb as pdb
+except ImportError:
+    import pdb
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 0.  CONFIG
+# ═════════════════════════════════════════════════════════════════════════════
+DEBUG             = False          # set True to hit breakpoints
+BREAK_AFTER_BATCH = False          # set True for a single-batch sanity run
+
+ROOT       = os.getcwd()
+BASE_DIR   = os.path.join(ROOT, "sdss_dr17_dataset")  # root where class subfolders live
+CSV_PATH   = os.path.join(ROOT, "SkyObjects.csv")
+OUT_DIR    = "/media/Ubunt_2/Project/pipeline_output"
+CKPT_DIR   = os.path.join(OUT_DIR, "checkpoints")
+os.makedirs(OUT_DIR,  exist_ok=True)
+os.makedirs(CKPT_DIR, exist_ok=True)
+
+CLASSES    = ["GALAXY", "QSO", "STAR"]
+
+# Raw photometric columns present in the CSV (before feature engineering)
+RAW_TAB_COLS = ["u", "g", "r", "i", "z"]
+
+# After build_features() the two candidate feature vectors are:
+TAB_DIM1   = 7
+FEAT_COLS1 = ["u", "g", "r", "i",
+              "u_g", "g_r", "r_i"]
+TAB_DIM2   = 9
+FEAT_COLS2 = ["u", "g", "r", "i", "z",
+              "u_g", "g_r", "r_i", "z_i"]
+# Union of both, used only to decide which rows to drop for missing data —
+# keeping the same rows for all three stages keeps their metrics comparable.
+FEAT_COLS_ALL = list(dict.fromkeys(FEAT_COLS1 + FEAT_COLS2))
+
+IMG_SIZE   = 128
+BATCH      = 32
+EPOCHS     = 100
+LR         = 1e-4
+SEED       = 42
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[config] device={DEVICE}  tabular1_dim={TAB_DIM1}  tabular2_dim={TAB_DIM2}")
+
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+
+
+def debug_break(label: str):
+    if DEBUG:
+        print(f"\n[DEBUG] breakpoint → {label}")
+        pdb.set_trace()
+
+
+def ckpt_path(label: str, epoch: int) -> str:
+    """Canonical checkpoint filename."""
+    return os.path.join(CKPT_DIR, f"ckpt_{label}_ep{epoch:03d}.pth")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 1.  FEATURE ENGINEERING
+# ═════════════════════════════════════════════════════════════════════════════
+
+def build_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Derives all tabular features from raw CSV columns.
+
+    Colour indices (u-g, g-r, r-i, z-i)
+    -------------------------------------
+    Magnitude differences encode the spectral energy distribution slope.
+    They are among the strongest class separators in SDSS photometry:
+      • Stars    → tight, well-defined colour locus
+      • QSOs     → blue excess, u-g < 0.6 typically
+      • Galaxies → redder, broader spread
+    """
+    df = df.copy()
+
+    # ── clip raw magnitudes (SDSS sentinel values: 999, -9999) ──────────
+    for col in RAW_TAB_COLS:
+        df[col] = pd.to_numeric(df[col], errors="coerce").clip(-5, 35)
+
+    # ── colour indices ────────────────────────────────────────────────────
+    df["u_g"] = df["u"] - df["g"]
+    df["g_r"] = df["g"] - df["r"]
+    df["r_i"] = df["r"] - df["i"]
+    df["z_i"] = df["z"] - df["i"]
+
+    # ── drop rows with any NaN in a feature needed by EITHER tabular set ─
+    before = len(df)
+    df = df.dropna(subset=FEAT_COLS_ALL).reset_index(drop=True)
+    print(f"[features] dropped {before - len(df)} rows with NaN features, "
+          f"{len(df)} remain")
+
+    return df
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 2.  DATASET
+# ═════════════════════════════════════════════════════════════════════════════
+
+class SDSSDataset(Dataset):
+    """
+    Returns (image_tensor, tab_tensor, label_int, filepath).
+
+    feat_cols : list of tabular columns to use, or None for image-only
+                (Stage 1) — in which case tab_tensor is an empty tensor
+                that the model simply never looks at.
+    tab_tensor, when present, is z-score normalised using a scaler that
+    was fit on the training split only.
+    """
+    def __init__(self, records: pd.DataFrame, feat_cols, scaler, transform=None):
+        self.records   = records.reset_index(drop=True)
+        self.transform = transform
+        self.class2idx = {c: i for i, c in enumerate(CLASSES)}
+
+        if feat_cols:
+            raw = self.records[feat_cols].values.astype(np.float32)
+            self.tab_array = scaler.transform(raw).astype(np.float32)
+        else:
+            self.tab_array = None
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, idx):
+        row   = self.records.iloc[idx]
+        label = self.class2idx[row["class"]]
+        path  = row["filepath"]
+        if self.tab_array is not None:
+            tab = torch.tensor(self.tab_array[idx], dtype=torch.float32)
+        else:
+            tab = torch.empty(0, dtype=torch.float32)
+        img = Image.open(path).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        return img, tab, label, path
+
+
+def build_splits(csv_path: str):
+    """
+    Reads CSV → engineers features → ONE stratified 70/20/10 split shared
+    by all three stages, so their held-out metrics are directly comparable.
+    Returns (df, idx_train, idx_val, idx_test).
+    """
+    df = pd.read_csv(csv_path)
+
+    def _path(row):
+        return os.path.join(BASE_DIR, str(row["class"]), f"{row['objid']}.jpg")
+    df["filepath"] = df.apply(_path, axis=1)
+    before = len(df)
+    df = df[df["filepath"].apply(os.path.exists)].reset_index(drop=True)
+    print(f"[data] {len(df)}/{before} images found on disk")
+
+    df = build_features(df)
+    debug_break("after feature engineering")
+
+    idx    = np.arange(len(df))
+    labels = df["class"].values
+
+    idx_tv,    idx_test  = train_test_split(
+        idx,    test_size=0.10,       stratify=labels,         random_state=SEED)
+    idx_train, idx_val   = train_test_split(
+        idx_tv, test_size=0.10/0.90,  stratify=labels[idx_tv], random_state=SEED)
+
+    print(f"[data] train={len(idx_train)}  val={len(idx_val)}  test={len(idx_test)}")
+    return df, idx_train, idx_val, idx_test
+
+
+def build_dataloaders(df, idx_train, idx_val, idx_test, feat_cols, scaler_name):
+    """
+    Builds train/val/test DataLoaders for a single stage.
+
+    feat_cols   : FEAT_COLS1 / FEAT_COLS2 / None (image-only).
+    scaler_name : filename under OUT_DIR to persist the fitted scaler to,
+                  or None when feat_cols is None (nothing to fit).
+    """
+    scaler = None
+    if feat_cols:
+        scaler = StandardScaler()
+        scaler.fit(df.iloc[idx_train][feat_cols].values.astype(np.float32))
+        with open(os.path.join(OUT_DIR, scaler_name), "wb") as f:
+            pickle.dump(scaler, f)
+
+    train_tf = transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.RandomAffine(degrees=15, scale=(0.85, 1.15)),  # rotate + rescale
+        transforms.ToTensor(),
+        transforms.Normalize([0.5]*3, [0.5]*3),
+    ])
+    eval_tf = transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5]*3, [0.5]*3),
+    ])
+
+    train_ds = SDSSDataset(df.iloc[idx_train], feat_cols, scaler, train_tf)
+    val_ds   = SDSSDataset(df.iloc[idx_val],   feat_cols, scaler, eval_tf)
+    test_ds  = SDSSDataset(df.iloc[idx_test],  feat_cols, scaler, eval_tf)
+
+    kw = dict(num_workers=2, pin_memory=True)
+    return (
+        DataLoader(train_ds, batch_size=BATCH, shuffle=True,  **kw),
+        DataLoader(val_ds,   batch_size=BATCH, shuffle=False, **kw),
+        DataLoader(test_ds,  batch_size=BATCH, shuffle=False, **kw),
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 3.  MODELS
+# ═════════════════════════════════════════════════════════════════════════════
+
+class ImageEncoder(nn.Module):
+    """4-block conv backbone → flat (feature_dim,) vector."""
+    def __init__(self):
+        super().__init__()
+        def _block(ci, co):
+            return nn.Sequential(
+                nn.Conv2d(ci, co, 3, padding=1), nn.BatchNorm2d(co), nn.ReLU(True),
+                nn.Conv2d(co, co, 3, padding=1), nn.BatchNorm2d(co), nn.ReLU(True),
+                nn.MaxPool2d(2), nn.Dropout2d(0.1),
+            )
+        self.net = nn.Sequential(
+            _block(3,   32),
+            _block(32,  64),
+            _block(64,  128),
+            _block(128, 256),
+        )
+        self.feature_dim = 256 * 8 * 8   # 16 384
+
+    def forward(self, x):
+        return self.net(x).flatten(1)
+
+
+class TabularEncoder(nn.Module):
+    """MLP that embeds the photometric feature vector (7-d or 9-d)."""
+    def __init__(self, in_dim, out_dim=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 64), nn.BatchNorm1d(64), nn.ReLU(True),
+            nn.Linear(64,     64), nn.BatchNorm1d(64), nn.ReLU(True),
+        )
+        self.out_dim = out_dim
+
+    def forward(self, x):
+        return self.net(x)
+
+
+# ── 3a. Stage 1 : image-only CNN ──────────────────────────────────────────────
+class ImageCNN(nn.Module):
+    def __init__(self, n_classes=3):
+        super().__init__()
+        self.img_enc  = ImageEncoder()
+        self.img_proj = nn.Sequential(
+            nn.Linear(self.img_enc.feature_dim, 256),
+            nn.BatchNorm1d(256), nn.ReLU(True), nn.Dropout(0.3),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(256, 128), nn.ReLU(True), nn.Dropout(0.4),
+            nn.Linear(128, n_classes),
+        )
+
+    def forward(self, img):
+        return self.head(self.img_proj(self.img_enc(img)))
+
+
+# ── 3b. Stage 2 / 3 : image + tabular CNN ─────────────────────────────────────
+class MultimodalCNN(nn.Module):
+    """Shared architecture for Stage 2 (tab_dim=TAB_DIM1) and Stage 3 (tab_dim=TAB_DIM2)."""
+    def __init__(self, tab_dim, n_classes=3):
+        super().__init__()
+        self.img_enc  = ImageEncoder()
+        self.tab_enc  = TabularEncoder(in_dim=tab_dim)
+        self.img_proj = nn.Sequential(
+            nn.Linear(self.img_enc.feature_dim, 256),
+            nn.BatchNorm1d(256), nn.ReLU(True), nn.Dropout(0.3),
+        )
+        self.tab_proj = nn.Sequential(
+            nn.Linear(self.tab_enc.out_dim, 256),
+            nn.BatchNorm1d(256), nn.ReLU(True),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(512, 128), nn.ReLU(True), nn.Dropout(0.4),
+            nn.Linear(128, n_classes),
+        )
+
+    def forward(self, img, tab):
+        img_feat = self.img_proj(self.img_enc(img))
+        tab_feat = self.tab_proj(self.tab_enc(tab))
+        return self.head(torch.cat([img_feat, tab_feat], dim=1))
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 4.  TRAINING UTILITIES
+# ═════════════════════════════════════════════════════════════════════════════
+
+def train_epoch_cls(model, loader, criterion, optimizer, use_tab, scheduler=None):
+    model.train()
+    total_loss, correct, n = 0., 0, 0
+    for bi, (imgs, tab, labels, _) in enumerate(loader):
+        imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+        optimizer.zero_grad()
+        if use_tab:
+            tab = tab.to(DEVICE)
+            out = model(imgs, tab)
+        else:
+            out = model(imgs)
+        loss = criterion(out, labels)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        # OneCycleLR is stepped once per BATCH, not per epoch
+        if isinstance(scheduler, optim.lr_scheduler.OneCycleLR):
+            scheduler.step()
+        total_loss += loss.item() * len(imgs)
+        correct    += (out.argmax(1) == labels).sum().item()
+        n          += len(imgs)
+        if BREAK_AFTER_BATCH:
+            debug_break(f"first train batch — out.shape={out.shape}")
+            break
+    return total_loss / n, correct / n
+
+
+@torch.no_grad()
+def eval_epoch_cls(model, loader, criterion, use_tab):
+    model.eval()
+    total_loss, correct, n = 0., 0, 0
+    for imgs, tab, labels, _ in loader:
+        imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+        if use_tab:
+            tab = tab.to(DEVICE)
+            out = model(imgs, tab)
+        else:
+            out = model(imgs)
+        loss = criterion(out, labels)
+        total_loss += loss.item() * len(imgs)
+        correct    += (out.argmax(1) == labels).sum().item()
+        n          += len(imgs)
+    return total_loss / n, correct / n
+
+
+def run_training(model, train_dl, val_dl, epochs, criterion, optimizer,
+                  scheduler=None, label="Model", use_tab=True):
+    """
+    Classification training loop shared by all three stages.
+    Returns history dict {train_loss, val_loss, train_acc, val_acc}.
+
+    Checkpointing strategy
+    ----------------------
+    • A checkpoint is written every epoch (not just on best-val).
+      This makes resume unambiguous: find the highest epoch checkpoint,
+      restore it, then continue from epoch+1.
+    • Best weights are tracked separately in memory and restored at the end.
+      The on-disk checkpoint is for crash recovery; the in-memory best_state
+      is for final model quality.
+    • Checkpoint saved as:  CKPT_DIR/ckpt_{label}_ep{epoch:03d}.pth
+    """
+    history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
+    best_val, best_epoch, best_state = float("inf"), 1, None
+    start_epoch = 1
+
+    # ── Resume: find the most recent completed epoch checkpoint ──────────
+    completed = [ep for ep in range(1, epochs + 1)
+                 if os.path.exists(ckpt_path(label, ep))]
+
+    if completed:
+        last_ep = max(completed)
+        print(f"[{label}] resuming from epoch {last_ep}/{epochs}")
+        ckpt = torch.load(ckpt_path(label, last_ep), map_location=DEVICE)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        history     = ckpt["history"]
+        best_val    = ckpt["best_val"]
+        best_epoch  = ckpt["best_epoch"]
+        start_epoch = last_ep + 1
+
+        if start_epoch > epochs:
+            print(f"[{label}] already complete, restoring best weights")
+            best_ckpt = torch.load(ckpt_path(label, best_epoch), map_location=DEVICE)
+            model.load_state_dict(best_ckpt["model_state_dict"])
+            return history
+
+    # ── Training loop ─────────────────────────────────────────────────────
+    for epoch in range(start_epoch, epochs + 1):
+        t0 = time.time()
+
+        tr_loss, tr_acc = train_epoch_cls(model, train_dl, criterion, optimizer,
+                                           use_tab, scheduler)
+        vl_loss, vl_acc = eval_epoch_cls(model, val_dl, criterion, use_tab)
+
+        history["train_loss"].append(tr_loss); history["val_loss"].append(vl_loss)
+        history["train_acc"].append(tr_acc);   history["val_acc"].append(vl_acc)
+
+        print(f"[{label}] epoch {epoch:>3}/{epochs}  "
+              f"loss {tr_loss:.4f}/{vl_loss:.4f}  "
+              f"acc {tr_acc:.4f}/{vl_acc:.4f}  "
+              f"({time.time()-t0:.1f}s)")
+
+        if vl_loss < best_val:
+            best_val, best_epoch = vl_loss, epoch
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+        # Save every epoch — safe to resume from any point
+        torch.save({
+            "epoch":                epoch,
+            "best_epoch":           best_epoch,
+            "best_val":             best_val,
+            "model_state_dict":     model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "history":              history,
+        }, ckpt_path(label, epoch))
+
+        # ReduceLROnPlateau (or similar) is stepped once per epoch;
+        # OneCycleLR was already stepped per batch inside train_epoch_cls.
+        if scheduler and not isinstance(scheduler, optim.lr_scheduler.OneCycleLR):
+            scheduler.step(vl_loss)
+
+    # Restore best weights
+    if best_state:
+        model.load_state_dict(best_state)
+
+    debug_break(f"after training [{label}]")
+    return history
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 5.  EVALUATION & VISUALISATION
+# ═════════════════════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def predict(model, loader, use_tab):
+    model.eval()
+    preds, labels = [], []
+    for imgs, tab, lbls, _ in loader:
+        imgs = imgs.to(DEVICE)
+        if use_tab:
+            tab = tab.to(DEVICE)
+            out = model(imgs, tab)
+        else:
+            out = model(imgs)
+        preds.append(out.argmax(1).cpu().numpy())
+        labels.append(lbls.numpy())
+    return np.concatenate(preds), np.concatenate(labels)
+
+
+def plot_training_curves(history, label, save_path):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    axes[0].plot(history["train_loss"], label="Train")
+    axes[0].plot(history["val_loss"],   label="Val")
+    axes[0].set_title(f"{label} — Loss")
+    axes[0].set_xlabel("Epoch"); axes[0].legend(); axes[0].grid(True, alpha=0.3)
+    axes[1].plot(history["train_acc"], label="Train")
+    axes[1].plot(history["val_acc"],   label="Val")
+    axes[1].set_title(f"{label} — Accuracy")
+    axes[1].set_xlabel("Epoch"); axes[1].legend(); axes[1].grid(True, alpha=0.3)
+    plt.tight_layout(); plt.savefig(save_path, dpi=150); plt.close()
+    print(f"[plot] {save_path}")
+
+
+def plot_confusion_matrix(preds, labels, label, save_path):
+    cm = confusion_matrix(labels, preds, normalize="true")
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, fmt=".2f", cmap="Blues",
+                xticklabels=CLASSES, yticklabels=CLASSES, ax=ax,
+                linewidths=0.5, linecolor="white")
+    ax.set_title(f"{label} — Confusion Matrix (normalised)")
+    ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+    plt.tight_layout(); plt.savefig(save_path, dpi=150); plt.close()
+    print(f"[plot] {save_path}")
+
+
+def report_metrics(preds, labels, label):
+    acc = accuracy_score(labels, preds)
+    f1  = f1_score(labels, preds, average="macro")
+    print(f"\n{'─'*55}\n {label}\n{'─'*55}")
+    print(f" Accuracy : {acc:.4f}   Macro-F1 : {f1:.4f}")
+    print(classification_report(labels, preds, target_names=CLASSES))
+    return {"label": label, "accuracy": acc, "macro_f1": f1}
+
+
+def plot_comparison(metrics_list, save_path):
+    names = [m["label"] for m in metrics_list]
+    accs  = [m["accuracy"] for m in metrics_list]
+    f1s   = [m["macro_f1"] for m in metrics_list]
+    x, w  = np.arange(len(names)), 0.35
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.bar(x - w/2, accs, w, label="Accuracy", color="#4C82C4")
+    ax.bar(x + w/2, f1s,  w, label="Macro-F1",  color="#E07B53")
+    ax.set_xticks(x); ax.set_xticklabels(names, rotation=10, ha="right")
+    ax.set_ylim(0, 1.1); ax.set_ylabel("Score")
+    ax.set_title("Model Comparison — Image vs Image+Tab1 vs Image+Tab2")
+    ax.legend(); ax.grid(axis="y", alpha=0.3)
+    for i, (a, f) in enumerate(zip(accs, f1s)):
+        ax.text(i - w/2, a + 0.01, f"{a:.3f}", ha="center", fontsize=9)
+        ax.text(i + w/2, f + 0.01, f"{f:.3f}", ha="center", fontsize=9)
+    plt.tight_layout(); plt.savefig(save_path, dpi=150); plt.close()
+    print(f"[plot] {save_path}")
+
+
+def plot_feature_distributions(df, save_path):
+    """
+    Box plots of every tabular feature per class.
+    Useful sanity check: if the features are NOT discriminative,
+    the distributions will heavily overlap → model will rely on images only.
+    """
+    plot_cols = ["u", "g", "r", "i", "z", "u_g", "g_r", "r_i", "z_i"]
+    palette   = {"GALAXY": "#4C82C4", "QSO": "#E07B53", "STAR": "#5FAD56"}
+    fig, axes = plt.subplots(2, 5, figsize=(18, 7))
+
+    for ax, col in zip(axes.flat, plot_cols):
+        data  = [df[df["class"] == cls][col].dropna().values for cls in CLASSES]
+        bp    = ax.boxplot(data, patch_artist=True, widths=0.5,
+                           medianprops=dict(color="black", linewidth=2),
+                           flierprops=dict(marker=".", markersize=1, alpha=0.3))
+        for patch, cls in zip(bp["boxes"], CLASSES):
+            patch.set_facecolor(palette[cls]); patch.set_alpha(0.65)
+        ax.set_title(col, fontsize=10)
+        ax.set_xticks([1, 2, 3]); ax.set_xticklabels(CLASSES, fontsize=8, rotation=15)
+        ax.grid(axis="y", alpha=0.3)
+
+    axes.flat[-1].axis("off")   # 10th subplot slot is unused (9 feature columns)
+    plt.suptitle("Tabular Feature Distributions per Class", fontsize=13, y=1.01)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight"); plt.close()
+    print(f"[plot] {save_path}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 6.  MAIN PIPELINE
+# ═════════════════════════════════════════════════════════════════════════════
+
+def main():
+
+    print("\n" + "═"*58)
+    print("  Stage 0 : Data & Feature Engineering")
+    print("═"*58)
+
+    df, idx_train, idx_val, idx_test = build_splits(CSV_PATH)
+    plot_feature_distributions(df, os.path.join(OUT_DIR, "feature_distributions.png"))
+
+    weights   = torch.tensor([1.0, 1.0, 2.0], device=DEVICE)
+    criterion = nn.CrossEntropyLoss(weight=weights)
+
+    # ─────────────────────────────────────────────────────────────────────
+    print("\n" + "═"*58)
+    print("  Stage 1 : CNN  (image → class)")
+    print("═"*58)
+
+    train_dl1, val_dl1, test_dl1 = build_dataloaders(
+        df, idx_train, idx_val, idx_test, feat_cols=None, scaler_name=None)
+
+    model1 = ImageCNN(n_classes=3).to(DEVICE)
+    opt1   = optim.Adam(model1.parameters(), lr=LR)
+    sched1 = optim.lr_scheduler.OneCycleLR(
+        opt1, max_lr=LR, steps_per_epoch=len(train_dl1), epochs=EPOCHS, pct_start=0.1)
+
+    debug_break("before Stage 1 (image-only) training")
+    hist1 = run_training(model1, train_dl1, val_dl1, EPOCHS, criterion, opt1, sched1,
+                          label="Stage1-image", use_tab=False)
+
+    plot_training_curves(hist1, "Stage 1 — CNN (image)",
+                         os.path.join(OUT_DIR, "stage1_curves.png"))
+    preds1, labels1 = predict(model1, test_dl1, use_tab=False)
+    metrics1 = report_metrics(preds1, labels1, "Stage 1 — CNN (image)")
+    plot_confusion_matrix(preds1, labels1, "Stage 1 — CNN (image)",
+                          os.path.join(OUT_DIR, "stage1_confusion.png"))
+    torch.save(model1.state_dict(), os.path.join(OUT_DIR, "stage1_image_cnn.pt"))
+    debug_break("after Stage 1 evaluation")
+
+    # ─────────────────────────────────────────────────────────────────────
+    print("\n" + "═"*58)
+    print("  Stage 2 : CNN + tabular1  (image + 7-d photometry → class)")
+    print("═"*58)
+
+    train_dl2, val_dl2, test_dl2 = build_dataloaders(
+        df, idx_train, idx_val, idx_test, FEAT_COLS1, "scaler_tab1.pkl")
+
+    model2 = MultimodalCNN(tab_dim=TAB_DIM1, n_classes=3).to(DEVICE)
+    opt2   = optim.Adam(model2.parameters(), lr=LR)
+    sched2 = optim.lr_scheduler.OneCycleLR(
+        opt2, max_lr=LR, steps_per_epoch=len(train_dl2), epochs=EPOCHS, pct_start=0.1)
+
+    debug_break("before Stage 2 (image+tab1) training")
+    hist2 = run_training(model2, train_dl2, val_dl2, EPOCHS, criterion, opt2, sched2,
+                          label="Stage2-tab1", use_tab=True)
+
+    plot_training_curves(hist2, "Stage 2 — CNN + Tab1",
+                         os.path.join(OUT_DIR, "stage2_curves.png"))
+    preds2, labels2 = predict(model2, test_dl2, use_tab=True)
+    metrics2 = report_metrics(preds2, labels2, "Stage 2 — CNN + Tab1")
+    plot_confusion_matrix(preds2, labels2, "Stage 2 — CNN + Tab1",
+                          os.path.join(OUT_DIR, "stage2_confusion.png"))
+    torch.save(model2.state_dict(), os.path.join(OUT_DIR, "stage2_cnn_tab1.pt"))
+    debug_break("after Stage 2 evaluation")
+
+    # ─────────────────────────────────────────────────────────────────────
+    print("\n" + "═"*58)
+    print("  Stage 3 : CNN + tabular2  (image + 9-d photometry → class)")
+    print("═"*58)
+
+    train_dl3, val_dl3, test_dl3 = build_dataloaders(
+        df, idx_train, idx_val, idx_test, FEAT_COLS2, "scaler_tab2.pkl")
+
+    model3 = MultimodalCNN(tab_dim=TAB_DIM2, n_classes=3).to(DEVICE)
+    opt3   = optim.Adam(model3.parameters(), lr=LR)
+    sched3 = optim.lr_scheduler.OneCycleLR(
+        opt3, max_lr=LR, steps_per_epoch=len(train_dl3), epochs=EPOCHS, pct_start=0.1)
+
+    debug_break("before Stage 3 (image+tab2) training")
+    hist3 = run_training(model3, train_dl3, val_dl3, EPOCHS, criterion, opt3, sched3,
+                          label="Stage3-tab2", use_tab=True)
+
+    plot_training_curves(hist3, "Stage 3 — CNN + Tab2",
+                         os.path.join(OUT_DIR, "stage3_curves.png"))
+    preds3, labels3 = predict(model3, test_dl3, use_tab=True)
+    metrics3 = report_metrics(preds3, labels3, "Stage 3 — CNN + Tab2")
+    plot_confusion_matrix(preds3, labels3, "Stage 3 — CNN + Tab2",
+                          os.path.join(OUT_DIR, "stage3_confusion.png"))
+    torch.save(model3.state_dict(), os.path.join(OUT_DIR, "stage3_cnn_tab2.pt"))
+    debug_break("after Stage 3 evaluation")
+
+    # ─────────────────────────────────────────────────────────────────────
+    print("\n" + "═"*58)
+    print("  Stage 4 : Metrics")
+    print("═"*58)
+
+    plot_comparison([metrics1, metrics2, metrics3],
+                    os.path.join(OUT_DIR, "comparison.png"))
+
+    print("\n[summary]")
+    for m in [metrics1, metrics2, metrics3]:
+        print(f"  {m['label']:<30}  acc={m['accuracy']:.4f}  f1={m['macro_f1']:.4f}")
+
+    print(f"\n[done] outputs → {OUT_DIR}/")
+    for f in sorted(os.listdir(OUT_DIR)):
+        print(f"  {f}")
+
+
+if __name__ == "__main__":
+    main()
