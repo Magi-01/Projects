@@ -1199,7 +1199,7 @@ def main():
     plot_training_curves(
         hist4,
         "Stage 4b — VAE Classifier",
-        os.path.join(OUT_DIR, "stage4b_curves.png")
+        os.path.join(OUT_DIR, "stage4_curves.png")
     )
 
 
