@@ -2,6 +2,7 @@
 myapp/
 venv/
 .env/
+env1/
 
 # Python Cache and build files
 __pycache__/
@@ -32,7 +33,6 @@ dist/
 *.pth
 *.json
 *.zip
-*.csv
 *.7z
 *.bz2
 *.npy
