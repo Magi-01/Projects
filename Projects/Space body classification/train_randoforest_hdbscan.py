@@ -29,8 +29,9 @@ from umap import UMAP
 from hdbscan import HDBSCAN
 import gc
 
-
-data = pd.read_csv("SkyObjects_FITS.csv")
+file_path = os.path.join(os.getcwd(),'SkyObjects_FITS.csv')
+print(file_path)
+data = pd.read_csv(file_path)
 data.columns
 useful_data = data[['u', 'g', 'r', 'i', 'z','petroRad_r', 'psfMag_r', 'modelMag_r', 'extinction_r','redshift','class']]
 useful_data['one_hot'],unique = pd.factorize(useful_data['class'])
