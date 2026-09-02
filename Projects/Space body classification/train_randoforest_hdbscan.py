@@ -119,9 +119,6 @@ for min_cluster_size in [10, 20, 50, 75, 100, 200, 300, 400, 800, 1200]:
         f"SCORE={score:.3f}"
     )
 labels_B = hdbscan_B.labels_
-y
-labels_A
-labels_B
 print(f"Pipeline A: ARI = {best_ari_A:.3f}, NMI = {best_nmi_A:.3f}")
 print(f"Pipeline B: ARI = {best_ari_B:.3f}, NMI = {best_nmi_B:.3f}")
 gc.collect()
@@ -192,7 +189,7 @@ cbar2.set_ticks([0, 1, 2])
 cbar2.set_ticklabels(['star', 'galaxy', 'qso'])
 
 plt.tight_layout()
-plt.savefig('3d_class_separation.png', dpi=300)
+plt.savefig('3d_class_separation.png', dpi=600)
 plt.show()
 
 # 3D Visualization: HDBSCAN clusters
@@ -219,6 +216,6 @@ ax2.set_zlabel('UMAP 3')
 plt.colorbar(scatter2, ax=ax2, label='Cluster', pad=0.1, shrink=0.8)
 
 plt.tight_layout()
-plt.savefig('3d_hdbscan_clusters.png', dpi=300)
+plt.savefig('3d_hdbscan_clusters.png', dpi=600)
 plt.show()
 gc.collect()
