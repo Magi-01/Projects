@@ -82,7 +82,7 @@ for min_cluster_size in [10, 20, 50, 75, 100, 200, 300, 400, 800, 1200]:
         f"SCORE={score:.3f}"
     )
 
-labels_A = hdbscan_A.labels_
+labels_A = hdbscan_A.labels_ if hdbscan_A != None else None
 umapp = UMAP(n_components=3, random_state=42)
 X_reduced_UMAP = umapp.fit_transform(X_scaled)
 
@@ -118,7 +118,7 @@ for min_cluster_size in [10, 20, 50, 75, 100, 200, 300, 400, 800, 1200]:
         f"NMI={nmi_B:.3f}, "
         f"SCORE={score:.3f}"
     )
-labels_B = hdbscan_B.labels_
+labels_B = hdbscan_B.labels_ if hdbscan_B != None else None
 print(f"Pipeline A: ARI = {best_ari_A:.3f}, NMI = {best_nmi_A:.3f}")
 print(f"Pipeline B: ARI = {best_ari_B:.3f}, NMI = {best_nmi_B:.3f}")
 gc.collect()
